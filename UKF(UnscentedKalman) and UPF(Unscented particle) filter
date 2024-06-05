@@ -1,0 +1,578 @@
+using UnityEngine;
+using System.Collections.Generic;
+using System;
+using TMPro;
+using System.Text;
+using System.IO;
+using System.Diagnostics;
+
+// Class implementing the Unscented Kalman Filter (UKF)
+public class UnscentedKalmanFilter
+{
+    public Vector4 x; // State vector
+    public Matrix4x4 P; // Estimate error covariance matrix
+    public Matrix4x4 Q; // Process noise covariance matrix
+    public Matrix4x4 R; // Measurement noise covariance matrix
+    public Matrix4x4 F; // State transition matrix
+    public Matrix4x4 H; // Measurement matrix
+
+    // UKF parameters
+    private float alpha = 1e-3f;  // Spread of the sigma points
+    private float beta = 2.0f;    // Incorporates prior knowledge of the distribution (2 is optimal for Gaussian)
+    private float kappa = 1.0f;   // Secondary scaling parameter
+    private int L;                // State dimension
+    private float lambda;         // Scaling parameter
+    private List<Vector4> sigmaPoints;
+    private float[] weightsMean, weightsCovariance;
+
+    // Constructor for UKF
+    public UnscentedKalmanFilter(int stateSize, int measurementSize)
+    {
+        L = stateSize;
+        lambda = alpha * alpha * (L + kappa) - L;
+        F = Matrix4x4.identity;
+        H = Matrix4x4.identity;
+        Q = Matrix4x4.zero;
+        R = Matrix4x4.zero;
+        P = Matrix4x4.identity;
+        x = Vector4.zero;
+        sigmaPoints = new List<Vector4>(2 * L + 1);
+        InitializeWeights();
+    }
+
+    // Initialize weights for the sigma points
+    private void InitializeWeights()
+    {
+        weightsMean = new float[2 * L + 1];
+        weightsCovariance = new float[2 * L + 1];
+        weightsMean[0] = lambda / (L + lambda);
+        weightsCovariance[0] = lambda / (L + lambda) + (1 - alpha * alpha + beta);
+
+        for (int i = 1; i < 2 * L + 1; i++)
+        {
+            weightsMean[i] = weightsCovariance[i] = 1.0f / (2 * (L + lambda));
+        }
+    }
+
+    // Set the process and measurement noise covariance matrices
+    public void SetNoiseMatrices(Matrix4x4 processNoise, Matrix4x4 measurementNoise)
+    {
+        Q = processNoise;
+        R = measurementNoise;
+    }
+
+    // Calculate the sigma points based on the current state and covariance
+    private void CalculateSigmaPoints()
+    {
+        Matrix4x4 sqrtP = MatrixSquareRoot(P);
+        sigmaPoints.Clear();
+        sigmaPoints.Add(x);
+
+        for (int i = 0; i < L; i++)
+        {
+            Vector4 col = new Vector4(sqrtP[0, i], sqrtP[1, i], sqrtP[2, i], sqrtP[3, i]);
+            sigmaPoints.Add(x + Mathf.Sqrt(L + lambda) * col);
+            sigmaPoints.Add(x - Mathf.Sqrt(L + lambda) * col);
+        }
+    }
+
+    // Prediction step of the UKF
+    public void Predict()
+    {
+        CalculateSigmaPoints();
+        x = Vector4.zero;
+        for (int i = 0; i < sigmaPoints.Count; i++)
+        {
+            x += sigmaPoints[i] * weightsMean[i]; // Using the weights for mean
+        }
+
+        P = Matrix4x4.zero;
+        for (int i = 0; i < sigmaPoints.Count; i++)
+        {
+            Vector4 diff = sigmaPoints[i] - x;
+            P = AddMatrices(P, MultiplyMatrixByScalar(OuterProduct(diff), weightsCovariance[i])); // Using the weights for covariance
+        }
+        P = AddMatrices(P, Q);
+    }
+
+    // Update step of the UKF
+    public void Update(Vector4 measurement)
+    {
+        // Generate sigma points for the current state estimate if not already updated in the Predict step
+        CalculateSigmaPoints();
+
+        // Transform sigma points into measurement space
+        List<Vector4> zSigmaPoints = new List<Vector4>(sigmaPoints.Count);
+        foreach (var sigmaPoint in sigmaPoints)
+        {
+            zSigmaPoints.Add(H * sigmaPoint); // Assuming H linearly maps state space to measurement space
+        }
+
+        // Predict measurement
+        Vector4 zPred = Vector4.zero;
+        for (int i = 0; i < zSigmaPoints.Count; i++)
+        {
+            zPred += zSigmaPoints[i] * weightsMean[i]; // Weighted sum for predicted measurement
+        }
+
+        // Calculate innovation covariance matrix S
+        Matrix4x4 S = Matrix4x4.zero;
+        for (int i = 0; i < zSigmaPoints.Count; i++)
+        {
+            Vector4 zDiff = zSigmaPoints[i] - zPred;
+            S = AddMatrices(S, MultiplyMatrixByScalar(OuterProduct(zDiff), weightsCovariance[i])); // Weighted outer product for covariance
+        }
+        S = AddMatrices(S, R); // Add measurement noise covariance
+
+        // Calculate cross covariance matrix between state and measurement
+        Matrix4x4 Tc = Matrix4x4.zero;
+        for (int i = 0; i < sigmaPoints.Count; i++)
+        {
+            Vector4 xDiff = sigmaPoints[i] - x; // State difference
+            Vector4 zDiff = zSigmaPoints[i] - zPred; // Measurement difference
+            Tc = AddMatrices(Tc, MultiplyMatrixByScalar(OuterProduct(xDiff, zDiff), weightsCovariance[i])); // Weighted cross covariance
+        }
+
+        // Calculate Kalman gain K
+        Matrix4x4 K = MultiplyMatrices(Tc, Matrix4x4.Inverse(S));
+
+        // Update state estimate
+        Vector4 y = measurement - zPred; // Measurement residual
+        x += K * y; // Adjusted by Kalman gain and innovation
+
+        // Update covariance matrix
+        P = SubtractMatrices(P, MultiplyMatrices(K, MultiplyMatrices(S, Transpose(K)))); // Joseph form for numerical stability
+    }
+
+    // Calculate the square root of a matrix (Cholesky decomposition)
+    private Matrix4x4 MatrixSquareRoot(Matrix4x4 matrix)
+    {
+        Matrix4x4 result = Matrix4x4.zero;
+
+        for (int i = 0; i < 4; i++)
+        {
+            for (int j = 0; j < i + 1; j++)
+            {
+                float sum = matrix[i, j];
+
+                for (int k = 0; k < j; k++)
+                {
+                    sum -= result[i, k] * result[j, k];
+                }
+
+                if (i == j)
+                {
+                    if (sum <= 0.0)
+                    {
+                        throw new Exception("Matrix is not positive definite");
+                    }
+                    result[i, j] = Mathf.Sqrt(sum);
+                }
+                else
+                {
+                    result[i, j] = sum / result[j, j];
+                }
+            }
+        }
+
+        return result;
+    }
+
+    // Calculate the outer product of two vectors
+    private Matrix4x4 OuterProduct(Vector4 a, Vector4 b)
+    {
+        Matrix4x4 result = new Matrix4x4();
+        for (int i = 0; i < 4; i++)
+        {
+            for (int j = 0; j < 4; j++)
+            {
+                result[i, j] = a[i] * b[j];
+            }
+        }
+        return result;
+    }
+
+    // Calculate the outer product of a vector with itself
+    private Matrix4x4 OuterProduct(Vector4 a)
+    {
+        return OuterProduct(a, a);
+    }
+
+    // Add two matrices
+    private Matrix4x4 AddMatrices(Matrix4x4 a, Matrix4x4 b)
+    {
+        Matrix4x4 result = new Matrix4x4();
+        for (int i = 0; i < 4; i++)
+        {
+            for (int j = 0; j < 4; j++)
+            {
+                result[i, j] = a[i, j] + b[i, j];
+            }
+        }
+        return result;
+    }
+
+    // Subtract matrix b from matrix a
+    private Matrix4x4 SubtractMatrices(Matrix4x4 a, Matrix4x4 b)
+    {
+        Matrix4x4 result = new Matrix4x4();
+        for (int i = 0; i < 4; i++)
+        {
+            for (int j = 0; j < 4; j++)
+            {
+                result[i, j] = a[i, j] - b[i, j];
+            }
+        }
+        return result;
+    }
+
+    // Multiply two matrices
+    private Matrix4x4 MultiplyMatrices(Matrix4x4 a, Matrix4x4 b)
+    {
+        Matrix4x4 result = new Matrix4x4();
+        for (int i = 0; i < 4; i++)
+        {
+            for (int j = 0; j < 4; j++)
+            {
+                result[i, j] = 0;
+                for (int k = 0; k < 4; k++)
+                {
+                    result[i, j] += a[i, k] * b[k, j];
+                }
+            }
+        }
+        return result;
+    }
+
+    // Transpose a matrix
+    private Matrix4x4 Transpose(Matrix4x4 matrix)
+    {
+        Matrix4x4 result = new Matrix4x4();
+        for (int i = 0; i < 4; i++)
+        {
+            for (int j = 0; j < 4; j++)
+            {
+                result[i, j] = matrix[j, i];
+            }
+        }
+        return result;
+    }
+
+    // Multiply a matrix by a scalar
+    private Matrix4x4 MultiplyMatrixByScalar(Matrix4x4 matrix, float scalar)
+    {
+        Matrix4x4 result = new Matrix4x4();
+        for (int i = 0; i < 4; i++)
+        {
+            for (int j = 0; j < 4; j++)
+            {
+                result[i, j] = matrix[i, j] * scalar;
+            }
+        }
+        return result;
+    }
+}
+
+// Class implementing the Unscented Particle Filter (UPF)
+public class UnscentedParticleFilter
+{
+    private UnscentedKalmanFilter ukf; // Reference UKF instance
+    public List<UnscentedKalmanFilter> particles; // List of particles (each a UKF)
+    public int numParticles;
+
+    // Constructor for UPF
+    public UnscentedParticleFilter(int numParticles, int stateSize, int measurementSize, UnscentedKalmanFilter ukf)
+    {
+        this.numParticles = numParticles;
+        this.ukf = ukf;
+        particles = new List<UnscentedKalmanFilter>();
+
+        for (int i = 0; i < numParticles; i++)
+        {
+            particles.Add(new UnscentedKalmanFilter(stateSize, measurementSize));
+        }
+    }
+
+    // Set the noise matrices for all particles
+    public void SetNoiseMatrices(Matrix4x4 processNoise, Matrix4x4 measurementNoise)
+    {
+        foreach (var particle in particles)
+        {
+            particle.SetNoiseMatrices(processNoise, measurementNoise);
+        }
+    }
+
+    // Predict the next state for all particles
+    public void Predict()
+    {
+        foreach (var particle in particles)
+        {
+            particle.Predict();
+        }
+    }
+
+    // Update the state of all particles based on the measurement
+    public void Update(Vector4 measurement)
+    {
+        foreach (var particle in particles)
+        {
+            particle.Update(measurement);
+        }
+    }
+
+    // Get the average state of all particles
+    public Vector3 GetAverageState()
+    {
+        Vector3 avgState = Vector3.zero;
+        foreach (var particle in particles)
+        {
+            avgState += new Vector3(particle.x.x, particle.x.y, particle.x.z);
+        }
+        return avgState / particles.Count;
+    }
+
+    // Get the fused orientation from all particles
+    public Quaternion GetFusedOrientation()
+    {
+        Vector3 viewingVector = new Vector3(ukf.x.z, 0, ukf.x.w);
+        if (viewingVector == Vector3.zero)
+        {
+            return Quaternion.identity;
+        }
+        float roll = ukf.x.x;
+        float pitch = ukf.x.y;
+        float yaw = Mathf.Atan2(viewingVector.z, viewingVector.x);
+        Quaternion orientation = Quaternion.Euler(roll, pitch, yaw);
+        Vector3 eulerAngles = orientation.eulerAngles;
+        return Quaternion.Euler(eulerAngles.x, eulerAngles.y, eulerAngles.z);
+    }
+}
+
+// Main class for the flight simulator head tracker
+public class FlightSimulatorHeadTracker : MonoBehaviour
+{
+    public GameObject cubePrefab; // Prefab for the cube
+    private GameObject cubeInstance; // Instance of the cube
+    public TMP_Text instructionsText; // Text for instructions
+    private Camera mainCamera; // Main camera reference
+    private StringBuilder dataLog = new StringBuilder(); // StringBuilder for tracking data
+    private StringBuilder matrixLog = new StringBuilder(); // StringBuilder for matrix data
+    private string trackingDataFileName = "HeadTrackingData.csv"; // File name for tracking data
+    private string matrixDataFileName = "MatrixData.csv"; // File name for matrix data
+    private UnscentedKalmanFilter ukf; // UKF instance
+    private UnscentedParticleFilter upf; // UPF instance
+    private DateTime startTime; // Start time for tracking
+    private int frameCount; // Frame count
+    private bool isTracking = false; // Flag for tracking state
+
+    private Stopwatch ukfStopwatch = new Stopwatch(); // Stopwatch for UKF timing
+    private Stopwatch upfStopwatch = new Stopwatch(); // Stopwatch for UPF timing
+    private Stopwatch fusionStopwatch = new Stopwatch(); // Stopwatch for fusion timing
+
+    void Start()
+    {
+        // Instantiate the cube prefab and set its initial position and rotation
+        cubeInstance = Instantiate(cubePrefab, new Vector3(0, 0.5f, 2), Quaternion.identity);
+        mainCamera = Camera.main;
+        instructionsText.text = "Please look at the stimulus object to start.";
+        startTime = DateTime.Now;
+
+        // Set the state and measurement sizes for the UKF and UPF filters
+        int stateSize = 4; // Adjusted: state and measurement sizes are set here.
+        int measurementSize = 3;
+        ukf = new UnscentedKalmanFilter(stateSize, measurementSize);
+        upf = new UnscentedParticleFilter(300, stateSize, measurementSize, ukf);
+
+        // Create noise matrices with scalar multiplication
+        Matrix4x4 ukfProcessNoise = CreateScaledIdentityMatrix(0.001f);
+        Matrix4x4 ukfMeasurementNoise = CreateScaledIdentityMatrix(0.001f);
+        Matrix4x4 upfProcessNoise = CreateScaledIdentityMatrix(0.001f);
+        Matrix4x4 upfMeasurementNoise = CreateScaledIdentityMatrix(0.001f);
+
+        // Set the noise matrices for the UKF and UPF filters
+        ukf.SetNoiseMatrices(ukfProcessNoise, ukfMeasurementNoise);
+        upf.SetNoiseMatrices(upfProcessNoise, upfMeasurementNoise);
+    }
+
+    // Helper function to create a scaled identity matrix
+    private Matrix4x4 CreateScaledIdentityMatrix(float scale)
+    {
+        // Create a new identity matrix
+        Matrix4x4 matrix = Matrix4x4.identity;
+
+        // Scale the diagonal elements of the matrix
+        matrix.m00 *= scale;
+        matrix.m11 *= scale;
+        matrix.m22 *= scale;
+        matrix.m33 *= scale;
+
+        // Return the scaled identity matrix
+        return matrix;
+    }
+
+    void Update()
+    {
+        Vector3 headPosition = mainCamera.transform.position;
+        Quaternion headRotation = mainCamera.transform.rotation;
+        Vector3 ukfPosition = new Vector3(ukf.x.x, ukf.x.y, ukf.x.z) + Vector3.one * 0.01f;
+        Vector3 upfPosition = upf.GetAverageState() + Vector3.one * -0.1f;
+        Vector3 fusedPosition = (ukfPosition + upfPosition) / 2;
+
+        if (cubeInstance && IsEyeGazingAtObject(cubeInstance) && !isTracking)
+        {
+            StartTracking();
+            cubeInstance.GetComponent<Renderer>().material.color = Color.green;
+        }
+
+        if (isTracking)
+        {
+            TrackAndLogHeadMovement(headPosition, headRotation);
+        }
+    }
+
+    // Check if the user is gazing at the target object
+    private bool IsEyeGazingAtObject(GameObject targetObject)
+    {
+        Ray gazeRay = new Ray(mainCamera.transform.position, mainCamera.transform.forward);
+        if (Physics.Raycast(gazeRay, out RaycastHit hitInfo))
+        {
+            return hitInfo.collider.gameObject == targetObject;
+        }
+        return false;
+    }
+
+    // Start the head tracking process
+    private void StartTracking()
+    {
+        isTracking = true;
+        instructionsText.gameObject.SetActive(false);
+    }
+
+    // Track and log head movement
+    void TrackAndLogHeadMovement(Vector3 headPosition, Quaternion headRotation)
+    {
+        Vector4 measurement = new Vector4(headPosition.x, headPosition.y, headPosition.z, 1);
+
+        ukfStopwatch.Restart();
+        ukf.Predict();
+        ukf.Update(measurement);
+        ukfStopwatch.Stop();
+
+        upfStopwatch.Restart();
+        upf.Predict();
+        upf.Update(measurement);
+        upfStopwatch.Stop();
+
+        fusionStopwatch.Restart();
+        Vector3 ukfPosition = new Vector3(ukf.x.x, ukf.x.y, ukf.x.z);
+        Quaternion ukfOrientation = CalculateOrientation(ukf.x);
+        Vector3 upfPosition = upf.GetAverageState();
+        Quaternion upfOrientation = upf.GetFusedOrientation();
+        Vector3 fusedPosition = (ukfPosition + upfPosition) / 2;
+        Quaternion fusedOrientation = Quaternion.Slerp(ukfOrientation, upfOrientation, 0.5f);
+        fusionStopwatch.Stop();
+
+        // Update cube position and rotation
+        cubeInstance.transform.position = headPosition + mainCamera.transform.forward * 2f; // Adjust the cube's position to be in front of the user
+        cubeInstance.transform.rotation = fusedOrientation;
+
+        LogData(headPosition, headRotation, ukfPosition, ukfOrientation, upfPosition, upfOrientation, fusedPosition, fusedOrientation);
+        frameCount++;
+
+        if (frameCount % 500 == 0)
+        {
+            SaveDataToFile();
+            LogMatrixData();
+        }
+    }
+
+    // Calculate the orientation from the state vector
+    private Quaternion CalculateOrientation(Vector4 state)
+    {
+        float roll = state.x;
+        float pitch = state.y;
+        float yaw = Mathf.Atan2(state.z, state.w);
+        return Quaternion.Euler(roll, pitch, yaw);
+    }
+
+    // Log tracking data
+    void LogData(Vector3 headPosition, Quaternion headRotation, Vector3 ukfPosition, Quaternion ukfOrientation, Vector3 upfPosition, Quaternion upfOrientation, Vector3 fusedPosition, Quaternion fusedOrientation)
+    {
+        float delay = (float)(DateTime.Now - startTime).TotalSeconds;
+        float ukfLatency = (float)ukfStopwatch.Elapsed.TotalMilliseconds;
+        float upfLatency = (float)upfStopwatch.Elapsed.TotalMilliseconds;
+        float fusionLatency = (float)fusionStopwatch.Elapsed.TotalMilliseconds;
+
+        dataLog.AppendLine($"{DateTime.Now:HH:mm:ss.fff},{frameCount},{delay}," +
+                           $"{headPosition.x},{headPosition.y},{headPosition.z}," +
+                           $"{headRotation.x},{headRotation.y},{headRotation.z},{headRotation.w}," +
+                           $"{ukfPosition.x},{ukfPosition.y},{ukfPosition.z}," +
+                           $"{ukfOrientation.x},{ukfOrientation.y},{ukfOrientation.z},{ukfOrientation.w}," +
+                           $"{upfPosition.x},{upfPosition.y},{upfPosition.z}," +
+                           $"{upfOrientation.x},{upfOrientation.y},{upfOrientation.z},{upfOrientation.w}," +
+                           $"{fusedPosition.x},{fusedPosition.y},{fusedPosition.z}," +
+                           $"{fusedOrientation.x},{fusedOrientation.y},{fusedOrientation.z},{fusedOrientation.w}," +
+                           $"{ukfLatency},{upfLatency},{fusionLatency}");
+    }
+
+    // Log matrix data for debugging
+    private void LogMatrixData()
+    {
+        matrixLog.Clear();
+        matrixLog.AppendLine($"Timestamp: {DateTime.Now:HH:mm:ss.fff}");
+        matrixLog.AppendLine("State Transition Matrix:");
+        matrixLog.AppendLine(FormatMatrixData(ukf.F));
+        matrixLog.AppendLine("Process Noise Covariance Matrix:");
+        matrixLog.AppendLine(FormatMatrixData(ukf.Q));
+        matrixLog.AppendLine("Measurement Matrix:");
+        matrixLog.AppendLine(FormatMatrixData(ukf.H));
+        matrixLog.AppendLine("Measurement Noise Covariance Matrix:");
+        matrixLog.AppendLine(FormatMatrixData(ukf.R));
+    }
+
+    // Save tracking and matrix data to file
+    private void SaveDataToFile()
+    {
+        string directoryPath = Path.Combine(Application.persistentDataPath, "TrackingData");
+        Directory.CreateDirectory(directoryPath);
+
+        string dataFilePath = Path.Combine(directoryPath, trackingDataFileName);
+        string matrixFilePath = Path.Combine(directoryPath, matrixDataFileName);
+
+        // Check if the data file exists, and write the header if it doesn't
+        if (!File.Exists(dataFilePath))
+        {
+            string header = "Timestamp,FrameCount,Delay,HeadPosX,HeadPosY,HeadPosZ,HeadRotX,HeadRotY,HeadRotZ,HeadRotW," +
+                            "UKFPosX,UKFPosY,UKFPosZ,UKFRotX,UKFRotY,UKFRotZ,UKFRotW," +
+                            "UPFPosX,UPFPosY,UPFPosZ,UPFRotX,UPFRotY,UPFRotZ,UPFRotW," +
+                            "FusedPosX,FusedPosY,FusedPosZ,FusedRotX,FusedRotY,FusedRotZ,FusedRotW," +
+                            "UKFLatency,UPFLatency,FusionLatency\n";
+            File.WriteAllText(dataFilePath, header);
+        }
+        File.AppendAllText(dataFilePath, dataLog.ToString());
+        dataLog.Clear();
+
+        // Check if the matrix file exists, and write the header if it doesn't
+        if (!File.Exists(matrixFilePath))
+        {
+            string matrixHeader = "Timestamp,State Transition Matrix,Process Noise Covariance Matrix,Measurement Matrix,Measurement Noise Covariance Matrix\n";
+            File.WriteAllText(matrixFilePath, matrixHeader);
+        }
+        File.AppendAllText(matrixFilePath, matrixLog.ToString());
+        matrixLog.Clear();
+    }
+
+    // Format matrix data for logging
+    private string FormatMatrixData(Matrix4x4 matrix)
+    {
+        return string.Format(
+            "{0,10:F4} {1,10:F4} {2,10:F4} {3,10:F4}\n" +
+            "{4,10:F4} {5,10:F4} {6,10:F4} {7,10:F4}\n" +
+            "{8,10:F4} {9,10:F4} {10,10:F4} {11,10:F4}\n" +
+            "{12,10:F4} {13,10:F4} {14,10:F4} {15,10:F4}\n",
+            matrix.m00, matrix.m01, matrix.m02, matrix.m03,
+            matrix.m10, matrix.m11, matrix.m12, matrix.m13,
+            matrix.m20, matrix.m21, matrix.m22, matrix.m23,
+            matrix.m30, matrix.m31, matrix.m32, matrix.m33);
+    }
+}
