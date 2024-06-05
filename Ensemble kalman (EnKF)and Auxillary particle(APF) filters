@@ -1,0 +1,599 @@
+using UnityEngine;
+using System.Collections.Generic;
+using System.Linq;
+using System.Diagnostics;
+using System.Text;
+using System.IO;
+using System;
+using TMPro;
+
+public class AdaptiveEnsembleKalmanAuxiliaryParticleFilter
+{
+    // Default process and measurement noise values
+    public const float DEFAULT_Q = 0.001f;
+    public const float DEFAULT_R = 0.01f;
+    public const float CLAMP_MAX_DISTANCE = 10.0f;
+
+    private float q;  // Process noise
+    private float r;  // Measurement noise
+
+    private Vector3 position = Vector3.zero;
+    private Quaternion orientation = Quaternion.identity;
+    private Vector3 velocity = Vector3.zero;
+
+    public EnsembleKalmanFilter enKF;  // Ensemble Kalman Filter
+    public AuxiliaryParticleFilter apf;  // Auxiliary Particle Filter
+    private List<float> enKFErrors;  // List to store Ensemble Kalman Filter errors
+    private List<float> apfErrors;  // List to store Auxiliary Particle Filter errors
+    private Matrix4x4 errorCovariance;  // Error covariance matrix
+
+    private float enKFWeight;  // Weight for the Ensemble Kalman Filter
+    private float apfWeight;  // Weight for the Auxiliary Particle Filter
+
+    public AdaptiveEnsembleKalmanAuxiliaryParticleFilter(int numEnsembles = 200, int numAuxiliaryParticles = 200, float processNoise = DEFAULT_Q, float measurementNoise = DEFAULT_R)
+    {
+        // Initialize process and measurement noise values
+        q = processNoise;
+        r = measurementNoise;
+
+        // Initialize the Ensemble Kalman Filter with state and measurement sizes
+        enKF = new EnsembleKalmanFilter(6, 3);
+        enKF.SetProcessNoiseCovariance(CreateScaledIdentityMatrix(q));
+        enKF.SetMeasurementNoiseCovariance(CreateScaledIdentityMatrix(r));
+
+        // Initialize the Auxiliary Particle Filter with state and measurement sizes
+        apf = new AuxiliaryParticleFilter(6, 3, numAuxiliaryParticles);
+
+        enKFErrors = new List<float>();
+        apfErrors = new List<float>();
+    }
+
+    public (Vector3 fusedPosition, Quaternion fusedOrientation) GetFusedEstimate(Vector3 headPosition, Quaternion headRotation, Vector3 acceleration, float deltaTime, float latencyCompensation)
+    {
+        // Update the Ensemble Kalman Filter
+        (Vector3 enKFPosition, Quaternion enKFOrientation, float enKFPredictionError) = enKF.Update(headPosition, headRotation, acceleration, deltaTime);
+
+        // Update the Auxiliary Particle Filter
+        apf.Update(headPosition, headRotation, deltaTime);
+
+        // Fuse the estimates from both filters
+        Vector3 fusedPosition = (enKFPosition * enKFWeight + apf.GetFilteredPosition() * apfWeight) / (enKFWeight + apfWeight);
+        Quaternion fusedOrientation = Quaternion.Slerp(enKFOrientation, apf.GetFilteredOrientation(), 0.5f);
+
+        // Update the weights based on the prediction errors
+        UpdateWeights(enKFPredictionError, apf.GetPredictionError());
+
+        return (fusedPosition, fusedOrientation);
+    }
+
+    private Matrix4x4 CreateScaledIdentityMatrix(float scale)
+    {
+        // Create a scaled identity matrix
+        Matrix4x4 matrix = Matrix4x4.identity;
+        matrix.m00 = scale;
+        matrix.m11 = scale;
+        matrix.m22 = scale;
+        matrix.m33 = scale;
+        return matrix;
+    }
+
+    private void UpdateWeights(float enKFError, float apfError)
+    {
+        // Update the weights for the filters based on their errors
+        enKFWeight = (enKFError == 0) ? 1 : 1 / (1 + enKFError);
+        apfWeight = (apfError == 0) ? 1 : 1 / (1 + apfError);
+        float totalWeight = enKFWeight + apfWeight;
+
+        enKFWeight /= totalWeight;
+        apfWeight /= totalWeight;
+    }
+}
+
+public class EnsembleKalmanFilter
+{
+    private Matrix4x4 processNoiseCovariance;
+    private Matrix4x4 measurementNoiseCovariance;
+    private Matrix4x4 errorCovariance;
+    private Vector4 state;
+
+    public EnsembleKalmanFilter(int stateSize, int measurementSize)
+    {
+        errorCovariance = Matrix4x4.identity;
+        state = Vector4.zero;
+    }
+
+    public void SetProcessNoiseCovariance(Matrix4x4 processNoiseCovariance)
+    {
+        this.processNoiseCovariance = processNoiseCovariance;
+    }
+
+    public void SetMeasurementNoiseCovariance(Matrix4x4 measurementNoiseCovariance)
+    {
+        this.measurementNoiseCovariance = measurementNoiseCovariance;
+    }
+
+    public Matrix4x4 GetProcessNoiseCovariance()
+    {
+        return processNoiseCovariance;
+    }
+
+    public Matrix4x4 GetMeasurementNoiseCovariance()
+    {
+        return measurementNoiseCovariance;
+    }
+
+    public Matrix4x4 GetErrorCovariance()
+    {
+        return errorCovariance;
+    }
+
+    public (Vector3 position, Quaternion orientation, float predictionError) Update(Vector3 headPosition, Quaternion headRotation, Vector3 acceleration, float deltaTime)
+    {
+        // Predict the state using the state transition matrix
+        Matrix4x4 f = GetStateTransitionMatrix(headPosition, headRotation, acceleration, deltaTime);
+        Matrix4x4 q = processNoiseCovariance;
+        Matrix4x4 h = GetMeasurementMatrix(headPosition, headRotation);
+        Matrix4x4 r = measurementNoiseCovariance;
+
+        // Update the state with the new measurements
+        Vector4 x = GetUpdatedState(state, f, q, h, r, headPosition, headRotation);
+
+        state = x;
+
+        Vector3 predictedPosition = x.GetPosition();
+        Quaternion predictedOrientation = headRotation; // Update with correct orientation calculation
+
+        float predictionError = Vector3.Distance(headPosition, predictedPosition);
+
+        return (predictedPosition, predictedOrientation, predictionError);
+    }
+
+    private Matrix4x4 GetStateTransitionMatrix(Vector3 headPosition, Quaternion headRotation, Vector3 acceleration, float deltaTime)
+    {
+        // Create a state transition matrix
+        Matrix4x4 matrix = Matrix4x4.identity;
+        matrix.m03 = headPosition.x * deltaTime;
+        matrix.m13 = headPosition.y * deltaTime;
+        matrix.m23 = headPosition.z * deltaTime;
+        return matrix;
+    }
+
+    private Matrix4x4 GetMeasurementMatrix(Vector3 headPosition, Quaternion headRotation)
+    {
+        // Create a measurement matrix
+        Matrix4x4 matrix = Matrix4x4.identity;
+        matrix.m00 = headPosition.x;
+        matrix.m11 = headPosition.y;
+        matrix.m22 = headPosition.z;
+        return matrix;
+    }
+
+    private Vector4 GetUpdatedState(Vector4 previousState, Matrix4x4 f, Matrix4x4 q, Matrix4x4 h, Matrix4x4 r, Vector3 headPosition, Quaternion headRotation)
+    {
+        // Predict the state
+        Vector4 predictedState = f * previousState;
+        Matrix4x4 p = AddMatrices(errorCovariance, q);
+
+        // Calculate the Kalman gain
+        Matrix4x4 hphT = MultiplyMatrices(MultiplyMatrices(h, p), h.transpose);
+        Matrix4x4 sum = AddMatrices(hphT, r);
+        Matrix4x4 sumInverse = Inverse(sum);
+
+        Matrix4x4 k = MultiplyMatrices(MultiplyMatrices(p, h.transpose), sumInverse);
+
+        // Update the state with the new measurements
+        Vector4 innovation = new Vector4(headPosition.x, headPosition.y, headPosition.z, 0);
+        Vector4 updatedState = predictedState + k * (innovation - h * predictedState);
+        Matrix4x4 updatedErrorCovariance = MultiplyMatrices(SubtractMatrices(Matrix4x4.identity, MultiplyMatrices(k, h)), p);
+
+        errorCovariance = updatedErrorCovariance;
+
+        return updatedState;
+    }
+
+    private Matrix4x4 AddMatrices(Matrix4x4 a, Matrix4x4 b)
+    {
+        // Add two matrices
+        Matrix4x4 result = new Matrix4x4();
+        for (int i = 0; i < 4; i++)
+        {
+            for (int j = 0; j < 4; j++)
+            {
+                result[i, j] = a[i, j] + b[i, j];
+            }
+        }
+        return result;
+    }
+
+    private Matrix4x4 SubtractMatrices(Matrix4x4 a, Matrix4x4 b)
+    {
+        // Subtract two matrices
+        Matrix4x4 result = new Matrix4x4();
+        for (int i = 0; i < 4; i++)
+        {
+            for (int j = 0; j < 4; j++)
+            {
+                result[i, j] = a[i, j] - b[i, j];
+            }
+        }
+        return result;
+    }
+
+    private Matrix4x4 MultiplyMatrices(Matrix4x4 a, Matrix4x4 b)
+    {
+        // Multiply two matrices
+        return a * b; // Matrix multiplication is supported
+    }
+
+    private Matrix4x4 Inverse(Matrix4x4 matrix)
+    {
+        // Invert a matrix
+        return Matrix4x4.Inverse(matrix); // Use Unity's built-in matrix inversion
+    }
+}
+
+public class AuxiliaryParticleFilter
+{
+    private int stateSize;
+    private int measurementSize;
+    private int numParticles;
+    private float[] weights;
+    private State[] states; // Changed to State type array
+
+    private Matrix4x4 processNoiseCovariance;
+    private Matrix4x4 measurementNoiseCovariance;
+    private Matrix4x4 errorCovariance;
+
+    private struct State
+    {
+        public Vector3 position;
+        public Quaternion rotation;
+
+        public State(Vector3 position, Quaternion rotation)
+        {
+            this.position = position;
+            this.rotation = rotation;
+        }
+    }
+
+    public AuxiliaryParticleFilter(int stateSize, int measurementSize, int numParticles = 100)
+    {
+        this.stateSize = stateSize;
+        this.measurementSize = measurementSize;
+        this.numParticles = numParticles;
+
+        weights = new float[numParticles];
+        states = new State[numParticles]; // Initialize with State type
+
+        InitializeParticles();
+    }
+
+    public void SetProcessNoiseCovariance(Matrix4x4 processNoiseCovariance)
+    {
+        this.processNoiseCovariance = processNoiseCovariance;
+    }
+
+    public void SetMeasurementNoiseCovariance(Matrix4x4 measurementNoiseCovariance)
+    {
+        this.measurementNoiseCovariance = measurementNoiseCovariance;
+    }
+
+    public Matrix4x4 GetProcessNoiseCovariance()
+    {
+        return processNoiseCovariance;
+    }
+
+    public Matrix4x4 GetMeasurementNoiseCovariance()
+    {
+        return measurementNoiseCovariance;
+    }
+
+    public Matrix4x4 GetErrorCovariance()
+    {
+        return errorCovariance;
+    }
+
+    public void Update(Vector3 headPosition, Quaternion headRotation, float deltaTime)
+    {
+        // Update each particle's state
+        Vector4 newState = new Vector4(headPosition.x, headPosition.y, headPosition.z, 1);
+
+        for (int i = 0; i < numParticles; i++)
+        {
+            weights[i] = 1;
+            states[i] = new State(newState.GetPosition(), headRotation); // Ensure state updates with quaternion
+        }
+    }
+
+    public Vector3 GetFilteredPosition()
+    {
+        // Get the weighted average position of all particles
+        float weightSum = weights.Sum();
+        Vector3 weightedSum = Vector3.zero;
+
+        for (int i = 0; i < numParticles; i++)
+        {
+            weightedSum += weights[i] * states[i].position;
+        }
+
+        return weightedSum / weightSum;
+    }
+
+    public Quaternion GetFilteredOrientation()
+    {
+        // Get the weighted average orientation of all particles
+        float weightSum = weights.Sum();
+        Quaternion weightedSum = new Quaternion(0, 0, 0, 0); // Initialize to zero quaternion
+
+        for (int i = 0; i < numParticles; i++)
+        {
+            weightedSum = Quaternion.Slerp(weightedSum, states[i].rotation, weights[i] / weightSum);
+        }
+
+        return weightedSum.normalized;
+    }
+
+    public float GetPredictionError()
+    {
+        // Calculate the prediction error
+        float errorSum = 0;
+
+        for (int i = 0; i < numParticles; i++)
+        {
+            errorSum += weights[i] * Vector3.Distance(states[i].position, Vector3.zero); // Replace with actual measurement
+        }
+
+        return errorSum;
+    }
+
+    private void InitializeParticles()
+    {
+        // Initialize particles with default values
+        weights = new float[numParticles];
+        states = new State[numParticles];
+
+        for (int i = 0; i < numParticles; i++)
+        {
+            weights[i] = 1f;
+            states[i] = new State(Vector3.zero, Quaternion.identity);
+        }
+    }
+}
+
+public static class Vector4Extensions
+{
+    public static Vector3 GetPosition(this Vector4 state)
+    {
+        // Extract position from Vector4 state
+        return new Vector3(state.x, state.y, state.z);
+    }
+
+    public static Quaternion GetOrientation(this Vector4 state)
+    {
+        // Extract orientation from Vector4 state
+        return Quaternion.identity; // Simplified for this example
+    }
+}
+
+public class FilterComparer : IComparer<(Vector3 fusedPosition, Quaternion fusedOrientation)>
+{
+    public int Compare((Vector3 fusedPosition, Quaternion fusedOrientation) x, (Vector3 fusedPosition, Quaternion fusedOrientation) y)
+    {
+        // Compare two fused positions based on their distances from the origin
+        float xDistance = Vector3.Distance(Vector3.zero, x.fusedPosition);
+        float yDistance = Vector3.Distance(Vector3.zero, y.fusedPosition);
+
+        if (xDistance < yDistance)
+        {
+            return -1;
+        }
+        else if (xDistance > yDistance)
+        {
+            return 1;
+        }
+        else
+        {
+            return 0;
+        }
+    }
+}
+
+public class FlightSimulatorHeadTracker : MonoBehaviour
+{
+    public GameObject cubePrefab;
+    private GameObject cubeInstance;
+    public TMP_Text instructionsText;
+    private Camera mainCamera;
+    private StringBuilder dataLog = new StringBuilder();
+    private StringBuilder matrixLog = new StringBuilder();
+    private string trackingDataFileName = "HeadTrackingData.csv";
+    private string matrixDataFileName = "MatrixData.csv";
+    private DateTime startTime;
+    private bool isTracking = false;
+    private int frameCount = 0;
+
+    private System.Diagnostics.Stopwatch kalmanStopwatch = new System.Diagnostics.Stopwatch();
+    private System.Diagnostics.Stopwatch particleStopwatch = new System.Diagnostics.Stopwatch();
+    private System.Diagnostics.Stopwatch fusionStopwatch = new System.Diagnostics.Stopwatch();
+
+    private AdaptiveEnsembleKalmanAuxiliaryParticleFilter hybridFilter = new AdaptiveEnsembleKalmanAuxiliaryParticleFilter(200, 200, 0.001f, 0.01f);
+
+    void Start()
+    {
+        // Instantiate the cube and initialize camera and text
+        cubeInstance = Instantiate(cubePrefab, new Vector3(0, 0.5f, 2), Quaternion.identity);
+        mainCamera = Camera.main;
+        instructionsText.text = "Please look at the stimulus object to start.";
+        startTime = DateTime.Now;
+    }
+
+    void Update()
+    {
+        Vector3 headPosition = mainCamera.transform.position;
+        Quaternion headRotation = mainCamera.transform.rotation;
+
+        // Start tracking when the user looks at the cube
+        if (cubeInstance && IsEyeGazingAtObject(cubeInstance) && !isTracking)
+        {
+            StartTracking();
+            cubeInstance.GetComponent<Renderer>().material.color = Color.green;
+        }
+
+        // Log tracking data if tracking is active
+        if (isTracking)
+        {
+            LogTrackingData(headPosition, headRotation);
+        }
+    }
+
+    private bool IsEyeGazingAtObject(GameObject targetObject)
+    {
+        // Check if the user is looking at the target object
+        Ray gazeRay = new Ray(mainCamera.transform.position, mainCamera.transform.forward);
+        if (Physics.Raycast(gazeRay, out RaycastHit hitInfo))
+        {
+            return hitInfo.collider.gameObject == targetObject;
+        }
+        return false;
+    }
+
+    private void StartTracking()
+    {
+        // Activate tracking and hide instructions
+        isTracking = true;
+        instructionsText.gameObject.SetActive(false);
+    }
+
+    private void LogMatrixData()
+    {
+        // Log matrix data for both filters
+        matrixLog.Clear();
+        matrixLog.AppendLine($"Timestamp: {DateTime.Now:HH:mm:ss.fff}");
+
+        // Logging Ensemble Kalman Filter matrices
+        matrixLog.AppendLine("Ensemble Kalman Filter - Process Noise Covariance Matrix:");
+        matrixLog.AppendLine(FormatMatrixData(hybridFilter.enKF.GetProcessNoiseCovariance()));
+        matrixLog.AppendLine("Ensemble Kalman Filter - Measurement Noise Covariance Matrix:");
+        matrixLog.AppendLine(FormatMatrixData(hybridFilter.enKF.GetMeasurementNoiseCovariance()));
+        matrixLog.AppendLine("Ensemble Kalman Filter - Error Covariance Matrix:");
+        matrixLog.AppendLine(FormatMatrixData(hybridFilter.enKF.GetErrorCovariance()));
+
+        // Logging Auxiliary Particle Filter matrices
+        matrixLog.AppendLine("Auxiliary Particle Filter - Process Noise Covariance Matrix:");
+        matrixLog.AppendLine(FormatMatrixData(hybridFilter.apf.GetProcessNoiseCovariance()));
+        matrixLog.AppendLine("Auxiliary Particle Filter - Measurement Noise Covariance Matrix:");
+        matrixLog.AppendLine(FormatMatrixData(hybridFilter.apf.GetMeasurementNoiseCovariance()));
+        matrixLog.AppendLine("Auxiliary Particle Filter - Error Covariance Matrix:");
+        matrixLog.AppendLine(FormatMatrixData(hybridFilter.apf.GetErrorCovariance()));
+
+        // Save matrix data to file
+        string matrixFilePath = Path.Combine(Application.persistentDataPath, "TrackingData", matrixDataFileName);
+        File.AppendAllText(matrixFilePath, matrixLog.ToString());
+    }
+
+    private void LogTrackingData(Vector3 headPosition, Quaternion headRotation)
+    {
+        // Log tracking data
+        Vector4 measurement = new Vector4(headPosition.x, headPosition.y, headPosition.z, 1);
+
+        kalmanStopwatch.Restart();
+        (Vector3 enKFPosition, Quaternion enKFOrientation, float enKFPredictionError) = hybridFilter.enKF.Update(headPosition, headRotation, Vector3.zero, Time.deltaTime);
+        kalmanStopwatch.Stop();
+
+        particleStopwatch.Restart();
+        hybridFilter.apf.Update(headPosition, headRotation, Time.deltaTime);
+        particleStopwatch.Stop();
+
+        fusionStopwatch.Restart();
+        (Vector3 fusedPosition, Quaternion fusedOrientation) = hybridFilter.GetFusedEstimate(headPosition, headRotation, Vector3.zero, Time.deltaTime, 0);
+        fusionStopwatch.Stop();
+
+        // Detailed logging for latency
+        UnityEngine.Debug.Log($"Kalman Latency: {kalmanStopwatch.Elapsed.TotalMilliseconds}");
+        UnityEngine.Debug.Log($"Particle Latency: {particleStopwatch.Elapsed.TotalMilliseconds}");
+        UnityEngine.Debug.Log($"Fusion Latency: {fusionStopwatch.Elapsed.TotalMilliseconds}");
+
+        // Update cube position and rotation
+        cubeInstance.transform.position = headPosition + mainCamera.transform.forward * 2f; // Adjust the cube's position to be in front of the user
+        cubeInstance.transform.rotation = fusedOrientation;
+
+        // Log data to the StringBuilder
+        LogData(headPosition, headRotation, enKFPosition, enKFOrientation, hybridFilter.apf.GetFilteredPosition(), hybridFilter.apf.GetFilteredOrientation(), fusedPosition, fusedOrientation);
+        frameCount++;
+
+        // Save data and log matrices every 500 frames
+        if (frameCount % 500 == 0)
+        {
+            SaveDataToFile();
+            LogMatrixData();
+        }
+    }
+
+    void LogData(Vector3 headPosition, Quaternion headRotation, Vector3 enKFPosition, Quaternion enKFOrientation, Vector3 apfPosition, Quaternion apfOrientation, Vector3 fusedPosition, Quaternion fusedOrientation)
+    {
+        // Log data with all required parameters
+        float delay = (float)(DateTime.Now - startTime).TotalSeconds;
+        float kalmanLatency = (float)kalmanStopwatch.Elapsed.TotalMilliseconds;
+        float particleLatency = (float)particleStopwatch.Elapsed.TotalMilliseconds;
+        float fusionLatency = (float)fusionStopwatch.Elapsed.TotalMilliseconds;
+
+        // Calculate orientation errors for comparison
+        float enKFOrientationError = Quaternion.Angle(headRotation, enKFOrientation);
+        float apfOrientationError = Quaternion.Angle(headRotation, apfOrientation);
+
+        dataLog.AppendLine($"{DateTime.Now:HH:mm:ss.fff},{frameCount},{delay}," +
+                           $"{headPosition.x},{headPosition.y},{headPosition.z},{headRotation.x},{headRotation.y},{headRotation.z},{headRotation.w}," +
+                           $"{enKFPosition.x},{enKFPosition.y},{enKFPosition.z},{enKFOrientation.x},{enKFOrientation.y},{enKFOrientation.z},{enKFOrientation.w}," +
+                           $"{apfPosition.x},{apfPosition.y},{apfPosition.z},{apfOrientation.x},{apfOrientation.y},{apfOrientation.z},{apfOrientation.w}," +
+                           $"{fusedPosition.x},{fusedPosition.y},{fusedPosition.z},{fusedOrientation.x},{fusedOrientation.y},{fusedOrientation.z},{fusedOrientation.w}," +
+                           $"{kalmanLatency},{particleLatency},{fusionLatency}," +
+                           $"{enKFOrientationError},{apfOrientationError}");
+    }
+
+    private void SaveDataToFile()
+    {
+        // Save tracking and matrix data to files
+        string directoryPath = Path.Combine(Application.persistentDataPath, "TrackingData");
+        Directory.CreateDirectory(directoryPath);
+
+        string dataFilePath = Path.Combine(directoryPath, trackingDataFileName);
+        string matrixFilePath = Path.Combine(directoryPath, matrixDataFileName);
+
+        // Save tracking data
+        bool dataFileExists = File.Exists(dataFilePath);
+        if (!dataFileExists)
+        {
+            string headings = "Timestamp,FrameCount,Delay,HeadPosX,HeadPosY,HeadPosZ,HeadRotX,HeadRotY,HeadRotZ,HeadRotW," +
+                              "ENKFPosX,ENKFPosY,ENKFPosZ,ENKFRotX,ENKFRotY,ENKFRotZ,ENKFRotW," +
+                              "APFPosX,APFPosY,APFPosZ,APFRotX,APFRotY,APFRotZ,APFRotW," +
+                              "FusedPosX,FusedPosY,FusedPosZ,FusedRotX,FusedRotY,FusedRotZ,FusedRotW," +
+                              "KalmanLatency,ParticleLatency,FusionLatency";
+            File.AppendAllText(dataFilePath, headings + Environment.NewLine);
+        }
+        File.AppendAllText(dataFilePath, dataLog.ToString());
+        dataLog.Clear();
+
+        // Save matrix data
+        bool matrixFileExists = File.Exists(matrixFilePath);
+        if (!matrixFileExists)
+        {
+            matrixLog.AppendLine("P_EKF,R_EKF,Q_EKF,P_APF,R_APF,Q_APF,P_HYBRID,R_HYBRID,Q_HYBRID");
+        }
+
+        matrixLog.AppendLine($"{FormatMatrixData(hybridFilter.enKF.GetErrorCovariance())},{FormatMatrixData(hybridFilter.enKF.GetMeasurementNoiseCovariance())},{FormatMatrixData(hybridFilter.enKF.GetProcessNoiseCovariance())}," +
+                             $"{FormatMatrixData(hybridFilter.apf.GetErrorCovariance())},{FormatMatrixData(hybridFilter.apf.GetMeasurementNoiseCovariance())},{FormatMatrixData(hybridFilter.apf.GetProcessNoiseCovariance())}," +
+                             $"{FormatMatrixData(hybridFilter.enKF.GetErrorCovariance())},{FormatMatrixData(hybridFilter.enKF.GetMeasurementNoiseCovariance())},{FormatMatrixData(hybridFilter.enKF.GetProcessNoiseCovariance())}");
+
+        File.AppendAllText(matrixFilePath, matrixLog.ToString());
+        matrixLog.Clear();
+    }
+
+    private string FormatMatrixData(Matrix4x4 matrix)
+    {
+        // Format matrix data as a comma-separated string
+        return $"{matrix.m00},{matrix.m01},{matrix.m02},{matrix.m03}," +
+               $"{matrix.m10},{matrix.m11},{matrix.m12},{matrix.m13}," +
+               $"{matrix.m20},{matrix.m21},{matrix.m22},{matrix.m23}," +
+               $"{matrix.m30},{matrix.m31},{matrix.m32},{matrix.m33}";
+    }
+}
