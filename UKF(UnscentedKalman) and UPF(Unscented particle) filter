@@ -17,9 +17,9 @@ public class UnscentedKalmanFilter
     public Matrix4x4 H; // Measurement matrix
 
     // UKF parameters
-    private float alpha = 1e-3f;  // Spread of the sigma points
-    private float beta = 2.0f;    // Incorporates prior knowledge of the distribution (2 is optimal for Gaussian)
-    private float kappa = 1.0f;   // Secondary scaling parameter
+    public float alpha = 1e-3f;  // Spread of the sigma points
+    public float beta = 2.0f;    // Incorporates prior knowledge of the distribution (2 is optimal for Gaussian)
+    public float kappa = 1.0f;   // Secondary scaling parameter
     private int L;                // State dimension
     private float lambda;         // Scaling parameter
     private List<Vector4> sigmaPoints;
@@ -40,7 +40,6 @@ public class UnscentedKalmanFilter
         InitializeWeights();
     }
 
-    // Initialize weights for the sigma points
     private void InitializeWeights()
     {
         weightsMean = new float[2 * L + 1];
@@ -54,14 +53,12 @@ public class UnscentedKalmanFilter
         }
     }
 
-    // Set the process and measurement noise covariance matrices
     public void SetNoiseMatrices(Matrix4x4 processNoise, Matrix4x4 measurementNoise)
     {
         Q = processNoise;
         R = measurementNoise;
     }
 
-    // Calculate the sigma points based on the current state and covariance
     private void CalculateSigmaPoints()
     {
         Matrix4x4 sqrtP = MatrixSquareRoot(P);
@@ -76,75 +73,64 @@ public class UnscentedKalmanFilter
         }
     }
 
-    // Prediction step of the UKF
     public void Predict()
     {
         CalculateSigmaPoints();
         x = Vector4.zero;
         for (int i = 0; i < sigmaPoints.Count; i++)
         {
-            x += sigmaPoints[i] * weightsMean[i]; // Using the weights for mean
+            x += sigmaPoints[i] * weightsMean[i];
         }
 
         P = Matrix4x4.zero;
         for (int i = 0; i < sigmaPoints.Count; i++)
         {
             Vector4 diff = sigmaPoints[i] - x;
-            P = AddMatrices(P, MultiplyMatrixByScalar(OuterProduct(diff), weightsCovariance[i])); // Using the weights for covariance
+            P = AddMatrices(P, MultiplyMatrixByScalar(OuterProduct(diff), weightsCovariance[i]));
         }
         P = AddMatrices(P, Q);
     }
 
-    // Update step of the UKF
     public void Update(Vector4 measurement)
     {
-        // Generate sigma points for the current state estimate if not already updated in the Predict step
         CalculateSigmaPoints();
 
-        // Transform sigma points into measurement space
         List<Vector4> zSigmaPoints = new List<Vector4>(sigmaPoints.Count);
         foreach (var sigmaPoint in sigmaPoints)
         {
-            zSigmaPoints.Add(H * sigmaPoint); // Assuming H linearly maps state space to measurement space
+            zSigmaPoints.Add(H * sigmaPoint);
         }
 
-        // Predict measurement
         Vector4 zPred = Vector4.zero;
         for (int i = 0; i < zSigmaPoints.Count; i++)
         {
-            zPred += zSigmaPoints[i] * weightsMean[i]; // Weighted sum for predicted measurement
+            zPred += zSigmaPoints[i] * weightsMean[i];
         }
 
-        // Calculate innovation covariance matrix S
         Matrix4x4 S = Matrix4x4.zero;
         for (int i = 0; i < zSigmaPoints.Count; i++)
         {
             Vector4 zDiff = zSigmaPoints[i] - zPred;
-            S = AddMatrices(S, MultiplyMatrixByScalar(OuterProduct(zDiff), weightsCovariance[i])); // Weighted outer product for covariance
+            S = AddMatrices(S, MultiplyMatrixByScalar(OuterProduct(zDiff), weightsCovariance[i]));
         }
-        S = AddMatrices(S, R); // Add measurement noise covariance
+        S = AddMatrices(S, R);
 
-        // Calculate cross covariance matrix between state and measurement
         Matrix4x4 Tc = Matrix4x4.zero;
         for (int i = 0; i < sigmaPoints.Count; i++)
         {
-            Vector4 xDiff = sigmaPoints[i] - x; // State difference
-            Vector4 zDiff = zSigmaPoints[i] - zPred; // Measurement difference
-            Tc = AddMatrices(Tc, MultiplyMatrixByScalar(OuterProduct(xDiff, zDiff), weightsCovariance[i])); // Weighted cross covariance
+            Vector4 xDiff = sigmaPoints[i] - x;
+            Vector4 zDiff = zSigmaPoints[i] - zPred;
+            Tc = AddMatrices(Tc, MultiplyMatrixByScalar(OuterProduct(xDiff, zDiff), weightsCovariance[i]));
         }
 
-        // Calculate Kalman gain K
         Matrix4x4 K = MultiplyMatrices(Tc, Matrix4x4.Inverse(S));
 
-        // Update state estimate
-        Vector4 y = measurement - zPred; // Measurement residual
-        x += K * y; // Adjusted by Kalman gain and innovation
+        Vector4 y = measurement - zPred;
+        x += K * y;
 
-        // Update covariance matrix
-        P = SubtractMatrices(P, MultiplyMatrices(K, MultiplyMatrices(S, Transpose(K)))); // Joseph form for numerical stability
+        P = SubtractMatrices(P, MultiplyMatrices(K, MultiplyMatrices(S, Transpose(K))));
     }
 
-    // Calculate the square root of a matrix (Cholesky decomposition)
     private Matrix4x4 MatrixSquareRoot(Matrix4x4 matrix)
     {
         Matrix4x4 result = Matrix4x4.zero;
@@ -178,7 +164,6 @@ public class UnscentedKalmanFilter
         return result;
     }
 
-    // Calculate the outer product of two vectors
     private Matrix4x4 OuterProduct(Vector4 a, Vector4 b)
     {
         Matrix4x4 result = new Matrix4x4();
@@ -192,13 +177,11 @@ public class UnscentedKalmanFilter
         return result;
     }
 
-    // Calculate the outer product of a vector with itself
     private Matrix4x4 OuterProduct(Vector4 a)
     {
         return OuterProduct(a, a);
     }
 
-    // Add two matrices
     private Matrix4x4 AddMatrices(Matrix4x4 a, Matrix4x4 b)
     {
         Matrix4x4 result = new Matrix4x4();
@@ -212,7 +195,6 @@ public class UnscentedKalmanFilter
         return result;
     }
 
-    // Subtract matrix b from matrix a
     private Matrix4x4 SubtractMatrices(Matrix4x4 a, Matrix4x4 b)
     {
         Matrix4x4 result = new Matrix4x4();
@@ -226,7 +208,6 @@ public class UnscentedKalmanFilter
         return result;
     }
 
-    // Multiply two matrices
     private Matrix4x4 MultiplyMatrices(Matrix4x4 a, Matrix4x4 b)
     {
         Matrix4x4 result = new Matrix4x4();
@@ -244,7 +225,6 @@ public class UnscentedKalmanFilter
         return result;
     }
 
-    // Transpose a matrix
     private Matrix4x4 Transpose(Matrix4x4 matrix)
     {
         Matrix4x4 result = new Matrix4x4();
@@ -258,7 +238,6 @@ public class UnscentedKalmanFilter
         return result;
     }
 
-    // Multiply a matrix by a scalar
     private Matrix4x4 MultiplyMatrixByScalar(Matrix4x4 matrix, float scalar)
     {
         Matrix4x4 result = new Matrix4x4();
@@ -280,6 +259,7 @@ public class UnscentedParticleFilter
     public List<UnscentedKalmanFilter> particles; // List of particles (each a UKF)
     public int numParticles;
 
+    // Constructor for
     // Constructor for UPF
     public UnscentedParticleFilter(int numParticles, int stateSize, int measurementSize, UnscentedKalmanFilter ukf)
     {
@@ -372,7 +352,7 @@ public class FlightSimulatorHeadTracker : MonoBehaviour
     void Start()
     {
         // Instantiate the cube prefab and set its initial position and rotation
-        cubeInstance = Instantiate(cubePrefab, new Vector3(0, 0.5f, 2), Quaternion.identity);
+        cubeInstance = Instantiate(cubePrefab, new Vector3(0f, 2f, 3), Quaternion.identity);
         mainCamera = Camera.main;
         instructionsText.text = "Please look at the stimulus object to start.";
         startTime = DateTime.Now;
@@ -380,8 +360,24 @@ public class FlightSimulatorHeadTracker : MonoBehaviour
         // Set the state and measurement sizes for the UKF and UPF filters
         int stateSize = 4; // Adjusted: state and measurement sizes are set here.
         int measurementSize = 3;
+
+        // Initialize UKF with different initial state and parameters
         ukf = new UnscentedKalmanFilter(stateSize, measurementSize);
+        ukf.x = new Vector4(0.1f, 0.2f, 0.3f, 0.4f); // different initial state
+        ukf.Q = CreateScaledIdentityMatrix(0.001f); // different process noise covariance
+        ukf.R = CreateScaledIdentityMatrix(0.01f); // different measurement noise covariance
+        ukf.alpha = 0.5f; // different sigma point spread
+        ukf.beta = 2.5f; // different sigma point spread
+        ukf.kappa = 1.5f; // different sigma point spread
+
+        // Initialize UPF with different initial state and parameters
         upf = new UnscentedParticleFilter(300, stateSize, measurementSize, ukf);
+        upf.particles[0].x = new Vector4(0.5f, 0.6f, 0.7f, 0.8f); // different initial state
+        upf.particles[0].Q = CreateScaledIdentityMatrix(0.005f); // different process noise covariance
+        upf.particles[0].R = CreateScaledIdentityMatrix(0.05f); // different measurement noise covariance
+        upf.particles[0].alpha = 0.8f; // different sigma point spread
+        upf.particles[0].beta = 3.5f; // different sigma point spread
+        upf.particles[0].kappa = 2.5f; // different sigma point spread
 
         // Create noise matrices with scalar multiplication
         Matrix4x4 ukfProcessNoise = CreateScaledIdentityMatrix(0.001f);
@@ -473,7 +469,7 @@ public class FlightSimulatorHeadTracker : MonoBehaviour
         fusionStopwatch.Stop();
 
         // Update cube position and rotation
-        cubeInstance.transform.position = headPosition + mainCamera.transform.forward * 2f; // Adjust the cube's position to be in front of the user
+        cubeInstance.transform.position = headPosition + mainCamera.transform.forward * 1.5f; // Adjust the cube's position to be in front of the user
         cubeInstance.transform.rotation = fusedOrientation;
 
         LogData(headPosition, headRotation, ukfPosition, ukfOrientation, upfPosition, upfOrientation, fusedPosition, fusedOrientation);
@@ -576,3 +572,4 @@ public class FlightSimulatorHeadTracker : MonoBehaviour
             matrix.m30, matrix.m31, matrix.m32, matrix.m33);
     }
 }
+
